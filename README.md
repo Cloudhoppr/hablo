@@ -3,14 +3,14 @@
 Most language learning apps teach you to read a language. A select few teach you to write it. But virtually none teach you the one skill that actually matters when you're standing in a market in Mexico City trying to ask where the bathroom is: speaking it.
 The dirty secret of mainstream language apps is that they're built around text. Flashcards, fill-in-the-blank, grammar drills — all optimized for the keyboard, not the vocal cords. Real conversational fluency demands something different: the ability to hear authentic pronunciation, to process and respond in real time, to practice the rhythm and cadence of a living language. Voice input isn't a feature — it's the whole ballgame. And it's been absent from nearly every language learning app on the market.
 We built HablaConmigo to fix that.
----
+
 
 ## What It Does
 
-HablaConmigo ("Talk With Me") is a voice-first AI language coach for English speakers learning Mexican Spanish. Not Castilian Spanish. Not "generic Latin American" Spanish. Mexican Spanish — with the vocabulary, slang, and cultural nuances you'd actually encounter.
+HablaConmigo is a voice-first AI language coach for English speakers learning Mexican Spanish. Not Castilian Spanish. Not "generic Latin American" Spanish. Mexican Spanish — with the vocabulary, slang, and cultural nuances you'd actually encounter.
 The experience is simple: you click a microphone, and you're in a conversation. The AI coach greets you, gauges your proficiency in the first few exchanges, and immediately personalizes the session to your level. Beginners get English-heavy guidance with Spanish vocabulary woven in. Intermediate learners get a code-switching mix that mirrors real bilingual conversations. Advanced users get the full immersion treatment — the coach speaks primarily in Mexican Spanish and only dips into English for nuanced grammar corrections.
 You can speak back, or type if you prefer. Either way, the coach responds intelligently, corrects your mistakes conversationally (not clinically), and keeps the dialogue flowing naturally. A live dual-channel waveform visualizer pulses with both your voice and the coach's — a constant visual reminder that this is a real, live exchange. Every session is persisted, browsable, and replayable in full transcript.
----
+
 
 ## How We Built It: The ElevenLabs Integration
 
@@ -22,7 +22,7 @@ From there, the pipeline is continuous and real-time:
 3. Audio → Browser: The coach's audio streams back as base64-encoded chunks via WebSocket audio events. These are decoded via the Web Audio API, queued as AudioBufferSourceNodes, and played back gaplessly. When the queue drains, the mic reopens for the user's next turn.
 4. Live Transcript: ElevenLabs sends user_transcript and agent_response events in parallel with the audio, populating a real-time scrolling chat transcript — so the exchange feels like iMessage, not a terminal.
 5. Interruption Handling: If the user speaks while the coach is talking, ElevenLabs fires an interruption event and all queued audio is immediately cleared — natural, human-like conversation flow, not robotic turn-waiting.
----
+
 
 ## Architecture Overview
 
@@ -33,7 +33,7 @@ HablaConmigo is a unified Next.js 15 App Router application — no separate back
 - Database: Supabase (PostgreSQL) for session and message persistence, with RLS policies separating browser-safe anon access from server-side writes
 - Security: All API keys (ELEVENLABS_API_KEY, GEMINI_API_KEY, SUPABASE_SERVICE_ROLE_KEY) are exclusively server-side. The browser holds only a short-lived signed URL and the Supabase anon key
 The core voice hook (use-conversation.ts) is the most complex piece — 442 lines managing the full WebSocket lifecycle, the Web Audio pipeline, turn-taking state, audio queuing, waveform analyser nodes, and Supabase persistence — all in a single, clean React hook.
----
+
 
 ## What's Next
 
