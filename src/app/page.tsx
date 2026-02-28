@@ -10,7 +10,7 @@ import { Waveform2D } from '@/components/visualizer/waveform-2d'
 import { api } from '@/lib/api'
 import type { Message } from '@/lib/types'
 
-type MicState = 'idle' | 'connecting' | 'recording' | 'error'
+type MicState = 'idle' | 'connecting' | 'recording' | 'waiting' | 'error'
 
 export default function Home() {
   const conversation = useConversation()
@@ -18,6 +18,7 @@ export default function Home() {
     connect,
     disconnect,
     isConnected,
+    isRecording,
     isSpeaking,
     error: convError,
     onUserTranscript,
@@ -36,92 +37,96 @@ export default function Home() {
   // Track message count to trigger title generation after 6 messages (3 exchanges)
   const messageCountRef = useRef(0)
 
+  // Stable refs so transcript callbacks always read the latest values without stale closures
+  const currentSessionRef = useRef(currentSession)
+  const setCurrentSessionRef = useRef(setCurrentSession)
+  const addMessageRef = useRef(addMessage)
+  useEffect(() => { currentSessionRef.current = currentSession }, [currentSession])
+  useEffect(() => { setCurrentSessionRef.current = setCurrentSession }, [setCurrentSession])
+  useEffect(() => { addMessageRef.current = addMessage }, [addMessage])
+
   // Text input state
   const [textValue, setTextValue] = useState('')
   const [isTextLoading, setIsTextLoading] = useState(false)
 
   // ---------------------------------------------------------------------------
   // Subscribe to transcript events from the conversation hook
+  // Register once on mount; callbacks read from stable refs so they never go stale.
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    onUserTranscript((text, isFinal) => {
-      if (isFinal) {
-        // Clear partial text and show thinking indicator
-        setPartialUserText(null)
-        setIsAgentThinking(true)
+    // Every user_transcript event from ElevenLabs is the final transcript
+    // (there is no is_final field — each event IS the completed transcription)
+    onUserTranscript((text) => {
+      // Clear partial text and show thinking indicator
+      setPartialUserText(null)
+      setIsAgentThinking(true)
 
-        // Build a local message object to show immediately
-        const msg: Message = {
-          id: crypto.randomUUID(),
-          session_id: currentSession?.id ?? '',
+      const session = currentSessionRef.current
+
+      // Build a local message object to show immediately
+      const msg: Message = {
+        id: crypto.randomUUID(),
+        session_id: session?.id ?? '',
+        role: 'user',
+        content: text,
+        original_audio_url: null,
+        language: null,
+        created_at: new Date().toISOString(),
+      }
+      addMessageRef.current(msg)
+      messageCountRef.current += 1
+
+      // Persist to Supabase (fire-and-forget)
+      if (session?.id) {
+        api.createMessage({
+          session_id: session.id,
           role: 'user',
           content: text,
-          original_audio_url: null,
-          language: null,
-          created_at: new Date().toISOString(),
-        }
-        addMessage(msg)
-        messageCountRef.current += 1
+        }).catch(() => {})
 
-        // Persist to Supabase (fire-and-forget)
-        if (currentSession?.id) {
-          api.createMessage({
-            session_id: currentSession.id,
-            role: 'user',
-            content: text,
-          }).then((saved) => {
-            // Optionally we could replace the optimistic message with the saved one,
-            // but for simplicity we just trigger title generation after 6 messages.
-            void saved
-          }).catch(() => {
-            // Non-critical: message display already happened optimistically
-          })
-
-          // Auto-generate title after first 6 messages (3 exchanges)
-          if (messageCountRef.current === 6) {
-            api.generateTitle(currentSession.id)
-              .then((updated) => setCurrentSession(updated))
-              .catch(() => {})
-          }
+        // Auto-generate title after first 6 messages (3 exchanges)
+        if (messageCountRef.current === 6) {
+          api.generateTitle(session.id)
+            .then((updated) => setCurrentSessionRef.current(updated))
+            .catch(() => {})
         }
-      } else {
-        // Partial transcript — show as live typing indicator
-        setPartialUserText(text)
       }
     })
 
     onAgentResponse((text) => {
       setIsAgentThinking(false)
 
+      const session = currentSessionRef.current
+
       const msg: Message = {
         id: crypto.randomUUID(),
-        session_id: currentSession?.id ?? '',
+        session_id: session?.id ?? '',
         role: 'assistant',
         content: text,
         original_audio_url: null,
         language: null,
         created_at: new Date().toISOString(),
       }
-      addMessage(msg)
+      addMessageRef.current(msg)
       messageCountRef.current += 1
 
       // Persist to Supabase (fire-and-forget)
-      if (currentSession?.id) {
+      if (session?.id) {
         api.createMessage({
-          session_id: currentSession.id,
+          session_id: session.id,
           role: 'assistant',
           content: text,
         }).catch(() => {})
 
         if (messageCountRef.current === 6) {
-          api.generateTitle(currentSession.id)
-            .then((updated) => setCurrentSession(updated))
+          api.generateTitle(session.id)
+            .then((updated) => setCurrentSessionRef.current(updated))
             .catch(() => {})
         }
       }
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSession?.id])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // intentionally empty — onUserTranscript/onAgentResponse are stable, callbacks read refs
 
   // Clear thinking indicator when AI starts speaking
   useEffect(() => {
@@ -199,6 +204,22 @@ export default function Home() {
   }, [textValue, isTextLoading, currentSession, setCurrentSession, addMessage])
 
   // ---------------------------------------------------------------------------
+  // End Session handler
+  // ---------------------------------------------------------------------------
+  const handleEndSession = useCallback(() => {
+    disconnect()
+    setMicState('idle')
+
+    // Mark session as ended in Supabase (fire-and-forget)
+    const session = currentSessionRef.current
+    if (session?.id) {
+      api.updateSession(session.id, { status: 'ended' })
+        .then((updated) => setCurrentSessionRef.current(updated))
+        .catch(() => {})
+    }
+  }, [disconnect])
+
+  // ---------------------------------------------------------------------------
   // Mic button handler
   // ---------------------------------------------------------------------------
   const handleMicClick = useCallback(async () => {
@@ -227,7 +248,13 @@ export default function Home() {
   }, [isConnected, disconnect, connect, currentSession, setCurrentSession])
 
   const effectiveMicState: MicState =
-    isConnected ? 'recording' : convError ? 'error' : micState
+    isConnected
+      ? isRecording
+        ? 'recording'
+        : 'waiting'
+      : convError
+        ? 'error'
+        : micState
 
   return (
     <div className="flex flex-1 flex-col h-full overflow-hidden">
@@ -237,10 +264,18 @@ export default function Home() {
           {currentSession?.title ?? 'New Session'}
         </h2>
         {isConnected && (
-          <span className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400 flex-shrink-0 ml-4">
-            <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-            Connected
-          </span>
+          <div className="flex items-center gap-3 flex-shrink-0 ml-4">
+            <span className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
+              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              Connected
+            </span>
+            <button
+              onClick={handleEndSession}
+              className="px-3 py-1.5 text-sm font-medium rounded-md bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-red-100 hover:text-red-700 dark:hover:bg-red-900/30 dark:hover:text-red-400 transition-colors"
+            >
+              End Session
+            </button>
+          </div>
         )}
       </header>
 

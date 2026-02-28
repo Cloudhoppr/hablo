@@ -2,7 +2,7 @@
 
 import { useCallback } from 'react'
 
-type MicState = 'idle' | 'connecting' | 'recording' | 'error'
+type MicState = 'idle' | 'connecting' | 'recording' | 'waiting' | 'error'
 
 interface MicButtonProps {
   state: MicState
@@ -39,6 +39,13 @@ export function MicButton({ state, isSpeaking = false, onClick, errorMessage }: 
       pulse: true,
       cursor: 'cursor-pointer',
     },
+    waiting: {
+      bg: 'bg-indigo-500',
+      ring: 'ring-4 ring-indigo-300 dark:ring-indigo-700',
+      icon: 'text-white',
+      pulse: false,
+      cursor: 'cursor-pointer',
+    },
     error: {
       bg: 'bg-red-600',
       ring: 'ring-4 ring-red-400',
@@ -55,7 +62,9 @@ export function MicButton({ state, isSpeaking = false, onClick, errorMessage }: 
         ? 'Connecting...'
         : state === 'recording'
           ? 'Stop voice conversation'
-          : 'Retry connection'
+          : state === 'waiting'
+            ? 'Coach is responding...'
+            : 'Retry connection'
 
   return (
     <div className="flex flex-col items-center gap-1">
@@ -130,7 +139,8 @@ export function MicButton({ state, isSpeaking = false, onClick, errorMessage }: 
       {/* Status label */}
       <span className="text-xs text-gray-400 dark:text-gray-500 h-4">
         {state === 'connecting' && 'Connecting…'}
-        {state === 'recording' && (isSpeaking ? 'Coach speaking…' : 'Listening…')}
+        {state === 'recording' && 'Listening…'}
+        {state === 'waiting' && (isSpeaking ? 'Coach speaking…' : 'Processing…')}
         {state === 'error' && (errorMessage ?? 'Connection error')}
       </span>
     </div>

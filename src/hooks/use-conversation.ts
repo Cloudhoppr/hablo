@@ -8,12 +8,12 @@ import { api } from '@/lib/api'
 // ---------------------------------------------------------------------------
 
 type ElevenLabsIncomingEvent =
-  | { type: 'conversation_initiation_metadata'; conversation_id: string }
-  | { type: 'user_transcript'; user_transcript: { text: string; is_final: boolean } }
-  | { type: 'agent_response'; agent_response: { text: string } }
-  | { type: 'agent_response_correction'; agent_response_correction: { text: string } }
-  | { type: 'audio'; audio: { chunk: string; alignment?: object } }
-  | { type: 'interruption' }
+  | { type: 'conversation_initiation_metadata'; conversation_initiation_metadata_event: { conversation_id: string; agent_output_audio_format?: string } }
+  | { type: 'user_transcript'; user_transcription_event: { user_transcript: string } }
+  | { type: 'agent_response'; agent_response_event: { agent_response: string } }
+  | { type: 'agent_response_correction'; agent_response_correction_event: { corrected_agent_response: string; original_agent_response: string } }
+  | { type: 'audio'; audio_event: { audio_base_64: string; event_id?: number } }
+  | { type: 'interruption'; interruption_event: { event_id: number } }
   | { type: 'ping'; ping_event: { event_id: number; ping_ms?: number } }
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ export interface UseConversationReturn {
   agentAnalyser: AnalyserNode | null
 
   // Transcript event subscriptions
-  onUserTranscript: (callback: (text: string, isFinal: boolean) => void) => void
+  onUserTranscript: (callback: (text: string) => void) => void
   onAgentResponse: (callback: (text: string) => void) => void
 }
 
@@ -52,6 +52,19 @@ function float32ToInt16(float32: Float32Array): Int16Array {
   return int16
 }
 
+/** Downsample Float32 PCM from sourceSampleRate to targetSampleRate */
+function downsample(float32: Float32Array, sourceSampleRate: number, targetSampleRate: number): Float32Array {
+  if (sourceSampleRate === targetSampleRate) return float32
+  const ratio = sourceSampleRate / targetSampleRate
+  const newLength = Math.round(float32.length / ratio)
+  const result = new Float32Array(newLength)
+  for (let i = 0; i < newLength; i++) {
+    const srcIndex = Math.round(i * ratio)
+    result[i] = float32[Math.min(srcIndex, float32.length - 1)]
+  }
+  return result
+}
+
 /** Encode an Int16Array to a base64 string */
 function int16ToBase64(int16: Int16Array): string {
   const bytes = new Uint8Array(int16.buffer)
@@ -62,14 +75,21 @@ function int16ToBase64(int16: Int16Array): string {
   return btoa(binary)
 }
 
-/** Decode a base64 string to an ArrayBuffer */
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
+/** Decode a base64-encoded PCM Int16 chunk into a playable AudioBuffer */
+function pcmBase64ToAudioBuffer(ctx: AudioContext, base64: string, sampleRate: number): AudioBuffer {
   const binary = atob(base64)
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i)
   }
-  return bytes.buffer
+  const int16 = new Int16Array(bytes.buffer)
+  const float32 = new Float32Array(int16.length)
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768
+  }
+  const audioBuffer = ctx.createBuffer(1, float32.length, sampleRate)
+  audioBuffer.getChannelData(0).set(float32)
+  return audioBuffer
 }
 
 // ---------------------------------------------------------------------------
@@ -93,27 +113,37 @@ export function useConversation(): UseConversationReturn {
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
 
   // Audio playback queue
-  const playbackQueueRef = useRef<ArrayBuffer[]>([])
+  const playbackQueueRef = useRef<string[]>([])
   const isPlayingRef = useRef(false)
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null)
   const agentGainRef = useRef<GainNode | null>(null)
 
-  // Transcript callbacks
-  const userTranscriptCallbacksRef = useRef<Array<(text: string, isFinal: boolean) => void>>([])
-  const agentResponseCallbacksRef = useRef<Array<(text: string) => void>>([])
+  // Half-duplex turn-taking: controls whether mic audio is sent to ElevenLabs
+  const isListeningRef = useRef(true)
+
+  // Agent audio output sample rate (parsed from initiation metadata, default PCM 16kHz)
+  const agentAudioSampleRateRef = useRef(16000)
+
+  // Accumulated agent response text (emitted as one message when the agent's turn ends)
+  const pendingAgentTextRef = useRef('')
+
+  // Transcript callbacks — single-slot (replace on each registration)
+  const userTranscriptCallbackRef = useRef<((text: string) => void) | null>(null)
+  const agentResponseCallbackRef = useRef<((text: string) => void) | null>(null)
 
   // ---------------------------------------------------------------------------
   // Transcript callback subscriptions
   // ---------------------------------------------------------------------------
 
   const onUserTranscript = useCallback(
-    (callback: (text: string, isFinal: boolean) => void) => {
-      userTranscriptCallbacksRef.current.push(callback)
+    (callback: (text: string) => void) => {
+      userTranscriptCallbackRef.current = callback
     },
     []
   )
 
   const onAgentResponse = useCallback((callback: (text: string) => void) => {
-    agentResponseCallbacksRef.current.push(callback)
+    agentResponseCallbackRef.current = callback
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -123,110 +153,71 @@ export function useConversation(): UseConversationReturn {
   const stopPlayback = useCallback(() => {
     playbackQueueRef.current = []
     isPlayingRef.current = false
+    if (currentSourceRef.current) {
+      try { currentSourceRef.current.stop() } catch { /* may already be stopped */ }
+      currentSourceRef.current = null
+    }
     setIsSpeaking(false)
   }, [])
 
-  const playNextChunk = useCallback(async () => {
-    if (!audioContextRef.current || playbackQueueRef.current.length === 0) {
+  const playNextChunk = useCallback(() => {
+    const ctx = audioContextRef.current
+    if (!ctx || playbackQueueRef.current.length === 0) {
       isPlayingRef.current = false
+      currentSourceRef.current = null
       setIsSpeaking(false)
+      // Emit the complete accumulated agent response as a single message
+      if (pendingAgentTextRef.current) {
+        agentResponseCallbackRef.current?.(pendingAgentTextRef.current)
+        pendingAgentTextRef.current = ''
+      }
+      // Half-duplex: resume listening now that agent finished speaking
+      isListeningRef.current = true
+      setIsRecording(true)
       return
     }
 
     isPlayingRef.current = true
     setIsSpeaking(true)
 
-    const chunk = playbackQueueRef.current.shift()!
+    const base64Chunk = playbackQueueRef.current.shift()!
 
     try {
-      const audioBuffer = await audioContextRef.current.decodeAudioData(chunk)
-      const source = audioContextRef.current.createBufferSource()
+      const sampleRate = agentAudioSampleRateRef.current
+      const audioBuffer = pcmBase64ToAudioBuffer(ctx, base64Chunk, sampleRate)
+      const source = ctx.createBufferSource()
       source.buffer = audioBuffer
+      currentSourceRef.current = source
 
       // Connect through agent gain node (for analyser) -> destination
       const gainNode = agentGainRef.current
       if (gainNode) {
         source.connect(gainNode)
       } else {
-        source.connect(audioContextRef.current.destination)
+        source.connect(ctx.destination)
       }
 
       source.onended = () => {
+        currentSourceRef.current = null
         playNextChunk()
       }
       source.start(0)
-    } catch {
-      // If decode fails (e.g. raw PCM without header), skip and continue
+    } catch (err) {
+      // If conversion fails, log and skip to next chunk
+      console.warn('[useConversation] Failed to process audio chunk, skipping:', err)
+      currentSourceRef.current = null
       playNextChunk()
     }
   }, [])
 
   const enqueueAudioChunk = useCallback(
     (base64Chunk: string) => {
-      const buffer = base64ToArrayBuffer(base64Chunk)
-      playbackQueueRef.current.push(buffer)
+      playbackQueueRef.current.push(base64Chunk)
       if (!isPlayingRef.current) {
         playNextChunk()
       }
     },
     [playNextChunk]
-  )
-
-  // ---------------------------------------------------------------------------
-  // WebSocket message handler
-  // ---------------------------------------------------------------------------
-
-  const handleWsMessage = useCallback(
-    (event: MessageEvent) => {
-      let data: ElevenLabsIncomingEvent
-      try {
-        data = JSON.parse(event.data as string)
-      } catch {
-        return
-      }
-
-      switch (data.type) {
-        case 'conversation_initiation_metadata':
-          setConversationId(data.conversation_id)
-          break
-
-        case 'ping':
-          wsRef.current?.send(
-            JSON.stringify({ type: 'pong', event_id: data.ping_event.event_id })
-          )
-          break
-
-        case 'user_transcript': {
-          const { text, is_final } = data.user_transcript
-          for (const cb of userTranscriptCallbacksRef.current) {
-            cb(text, is_final)
-          }
-          break
-        }
-
-        case 'agent_response':
-        case 'agent_response_correction': {
-          const text =
-            data.type === 'agent_response'
-              ? data.agent_response.text
-              : (data as { type: 'agent_response_correction'; agent_response_correction: { text: string } })
-                  .agent_response_correction.text
-          for (const cb of agentResponseCallbacksRef.current) {
-            cb(text)
-          }
-          break
-        }
-
-        case 'audio':
-          enqueueAudioChunk(data.audio.chunk)
-          break
-
-        case 'interruption':
-          stopPlayback()
-          break
-      }
-    },
-    [enqueueAudioChunk, stopPlayback]
   )
 
   // ---------------------------------------------------------------------------
@@ -248,9 +239,18 @@ export function useConversation(): UseConversationReturn {
         return
       }
 
-      // 2. Set up AudioContext
-      const audioContext = new AudioContext({ sampleRate: 16000 })
+      // 2. Set up AudioContext at the device's native sample rate (NOT 16kHz)
+      //    This ensures decodeAudioData works correctly for agent audio playback.
+      //    We downsample mic audio to 16kHz manually before sending to ElevenLabs.
+      const audioContext = new AudioContext()
       audioContextRef.current = audioContext
+
+      // Resume context if it was created in a suspended state (autoplay policy)
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume()
+      }
+
+      const nativeSampleRate = audioContext.sampleRate
 
       // 3. Create AnalyserNodes
       const userAnalyser = audioContext.createAnalyser()
@@ -289,27 +289,108 @@ export function useConversation(): UseConversationReturn {
       const processor = audioContext.createScriptProcessor(4096, 1, 1)
       processorRef.current = processor
       micSource.connect(processor)
-      processor.connect(audioContext.destination) // must connect to destination to fire
+      processor.connect(audioContext.destination) // must connect to destination to fire onaudioprocess
 
       // 6. Open WebSocket
       const ws = new WebSocket(signedUrl)
       wsRef.current = ws
 
+      // Use a function that reads refs so we always get the latest callbacks
+      const handleMessage = (event: MessageEvent) => {
+        let data: ElevenLabsIncomingEvent
+        try {
+          data = JSON.parse(event.data as string)
+        } catch {
+          return
+        }
+
+        switch (data.type) {
+          case 'conversation_initiation_metadata': {
+            const meta = data.conversation_initiation_metadata_event
+            setConversationId(meta.conversation_id)
+            // Parse agent output audio format (e.g. "pcm_16000" → 16000)
+            const format = meta.agent_output_audio_format
+            if (format?.startsWith('pcm_')) {
+              const rate = parseInt(format.substring(4), 10)
+              if (!isNaN(rate) && rate > 0) agentAudioSampleRateRef.current = rate
+            }
+            break
+          }
+
+          case 'ping': {
+            const { event_id, ping_ms } = data.ping_event
+            const sendPong = () => ws.send(JSON.stringify({ type: 'pong', event_id }))
+            if (ping_ms && ping_ms > 0) {
+              setTimeout(sendPong, ping_ms)
+            } else {
+              sendPong()
+            }
+            break
+          }
+
+          case 'user_transcript': {
+            const text = data.user_transcription_event.user_transcript
+            // Half-duplex: stop sending mic audio once user finishes speaking
+            isListeningRef.current = false
+            setIsRecording(false)
+            userTranscriptCallbackRef.current?.(text)
+            break
+          }
+
+          case 'agent_response': {
+            // Accumulate streamed text chunks — emitted as one message when audio finishes
+            const text = data.agent_response_event.agent_response
+            pendingAgentTextRef.current += text
+            break
+          }
+
+          case 'agent_response_correction': {
+            // Corrections replace the entire accumulated response
+            const text = data.agent_response_correction_event.corrected_agent_response
+            pendingAgentTextRef.current = text
+            break
+          }
+
+          case 'audio':
+            enqueueAudioChunk(data.audio_event.audio_base_64)
+            break
+
+          case 'interruption':
+            // Emit any partial agent text before stopping
+            if (pendingAgentTextRef.current) {
+              agentResponseCallbackRef.current?.(pendingAgentTextRef.current)
+              pendingAgentTextRef.current = ''
+            }
+            stopPlayback()
+            // Resume listening after interruption
+            isListeningRef.current = true
+            setIsRecording(true)
+            break
+        }
+      }
+
       ws.addEventListener('open', () => {
         setIsConnected(true)
         setIsRecording(true)
 
+        // Send required initiation message per ElevenLabs WebSocket protocol
+        ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }))
+
         // Start sending audio chunks after WS opens
         processor.onaudioprocess = (e) => {
           if (ws.readyState !== WebSocket.OPEN) return
+          // Half-duplex: only send audio when it's the user's turn
+          if (!isListeningRef.current) return
           const float32 = e.inputBuffer.getChannelData(0)
-          const int16 = float32ToInt16(float32)
+          // Downsample from native sample rate to 16kHz for ElevenLabs
+          const downsampled = downsample(float32, nativeSampleRate, 16000)
+          const int16 = float32ToInt16(downsampled)
           const b64 = int16ToBase64(int16)
           ws.send(JSON.stringify({ user_audio_chunk: b64 }))
         }
       })
 
-      ws.addEventListener('message', handleWsMessage)
+      ws.addEventListener('message', handleMessage)
 
       ws.addEventListener('error', () => {
         setError('WebSocket connection error')
@@ -324,7 +405,7 @@ export function useConversation(): UseConversationReturn {
       // Store sessionId for potential future use (e.g. message persistence)
       void sessionId
     },
-    [handleWsMessage]
+    [enqueueAudioChunk, stopPlayback]
   )
 
   // ---------------------------------------------------------------------------
@@ -332,6 +413,12 @@ export function useConversation(): UseConversationReturn {
   // ---------------------------------------------------------------------------
 
   const disconnect = useCallback(() => {
+    // Emit any pending agent response text before tearing down
+    if (pendingAgentTextRef.current) {
+      agentResponseCallbackRef.current?.(pendingAgentTextRef.current)
+      pendingAgentTextRef.current = ''
+    }
+
     // Stop mic processor
     if (processorRef.current) {
       processorRef.current.onaudioprocess = null
@@ -371,6 +458,9 @@ export function useConversation(): UseConversationReturn {
     setIsRecording(false)
     setIsSpeaking(false)
     setConversationId(null)
+    isListeningRef.current = true
+    agentAudioSampleRateRef.current = 16000
+    pendingAgentTextRef.current = ''
   }, [stopPlayback])
 
   // ---------------------------------------------------------------------------
